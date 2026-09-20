@@ -259,8 +259,10 @@ def test_new_pullcheck_uses_canonical_weekly_key_casing():
     assert 'week["Issue"]' not in source
 
     # SQLAlchemy weekly table columns use these exact names.
-    assert 'newValue["WEEKNUMBER"]' not in source
-    assert 'newValue["YEAR"]' not in source
+    # Reject these invalid weekly column names in every syntax form,
+    # including both subscript assignments and dictionary literals.
+    assert '"WEEKNUMBER"' not in source
+    assert '"YEAR"' not in source
     assert 'newValue["Status"]' not in source
 
     assert 'newValue["weeknumber"]' in source
