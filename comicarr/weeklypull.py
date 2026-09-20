@@ -1312,8 +1312,8 @@ def new_pullcheck(weeknumber, pullyear, comic1off_name=None, comic1off_id=None, 
                             "ComicID": comicid,
                             "COMIC": week["ComicName"],
                             "ISSUE": week["issue"],
-                            "WEEKNUMBER": int(weeknumber),
-                            "YEAR": pullyear,
+                            "weeknumber": int(weeknumber),
+                            "year": pullyear,
                         }
 
                     if not issueid:
