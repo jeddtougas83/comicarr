@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import insert
 
 import comicarr
-from comicarr import db, weeklypull
+from comicarr import db, locg, weeklypull
 from comicarr.tables import metadata, weekly
 
 
@@ -250,6 +250,144 @@ def test_pullit_drops_origin_metadata_when_later_week_fails_without_origin(monke
     assert "cause" not in result
     assert "retry_after" not in result
 
+def test_weekly_release_ingestion_preserves_legacy_key_semantics(tmp_path, monkeypatch):
+    """Weekly ingestion must work without UNIQUE(ComicID, IssueID)."""
+    monkeypatch.setattr(comicarr, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(comicarr, "CONFIG", SimpleNamespace())
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    db.shutdown_engine()
+    engine = db.get_engine()
+
+    try:
+        # Legacy installed schema: rowid primary key only.
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE weekly (
+                    SHIPDATE TEXT,
+                    PUBLISHER TEXT,
+                    ISSUE TEXT,
+                    COMIC VARCHAR(150),
+                    EXTRA TEXT,
+                    STATUS TEXT,
+                    ComicID TEXT,
+                    IssueID TEXT,
+                    CV_Last_Update TEXT,
+                    DynamicName TEXT,
+                    weeknumber TEXT,
+                    year TEXT,
+                    volume TEXT,
+                    seriesyear TEXT,
+                    annuallink TEXT,
+                    format TEXT,
+                    rowid INTEGER PRIMARY KEY AUTOINCREMENT
+                )
+                """
+            )
+
+        control = {
+            "DynamicName": "doctorstrange",
+            "ISSUE": "10",
+        }
+
+        first_values = {
+            "SHIPDATE": "2026-09-02",
+            "PUBLISHER": "Marvel",
+            "STATUS": "Skipped",
+            "COMIC": "Doctor Strange",
+            "ComicID": "168938",
+            "IssueID": None,
+            "weeknumber": "35",
+            "annuallink": None,
+            "year": "2026",
+            "volume": "2025",
+            "seriesyear": "2025",
+            "format": "Print",
+        }
+
+        result = locg._upsert_weekly_release(
+            control,
+            first_values,
+        )
+
+        assert result == "inserted"
+
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                """
+                SELECT
+                    rowid,
+                    DynamicName,
+                    ISSUE,
+                    STATUS,
+                    ComicID,
+                    IssueID,
+                    weeknumber,
+                    year
+                FROM weekly
+                """
+            ).mappings().all()
+
+        assert len(rows) == 1
+
+        original_rowid = rows[0]["rowid"]
+
+        assert rows[0]["DynamicName"] == "doctorstrange"
+        assert rows[0]["ISSUE"] == "10"
+        assert str(rows[0]["weeknumber"]) == "35"
+
+        # A later provider refresh for the same logical issue should
+        # UPDATE that existing release, not require an SQL UNIQUE key
+        # and not create a duplicate.
+        second_values = {
+            **first_values,
+            "SHIPDATE": "2026-09-09",
+            "STATUS": "Downloaded",
+            "IssueID": "1234567",
+            "weeknumber": "36",
+        }
+
+        result = locg._upsert_weekly_release(
+            control,
+            second_values,
+        )
+
+        assert result == "updated"
+
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                """
+                SELECT
+                    rowid,
+                    DynamicName,
+                    ISSUE,
+                    STATUS,
+                    ComicID,
+                    IssueID,
+                    weeknumber,
+                    year
+                FROM weekly
+                """
+            ).mappings().all()
+
+        assert len(rows) == 1
+
+        row = rows[0]
+
+        assert row["rowid"] == original_rowid
+        assert row["DynamicName"] == "doctorstrange"
+        assert row["ISSUE"] == "10"
+        assert row["STATUS"] == "Downloaded"
+        assert row["ComicID"] == "168938"
+        assert row["IssueID"] == "1234567"
+        assert str(row["weeknumber"]) == "36"
+        assert str(row["year"]) == "2026"
+
+    finally:
+        db.shutdown_engine()
+
+
 def test_update_weekly_row_uses_rowid_without_upsert_constraint(tmp_path, monkeypatch):
     """Existing weekly rows must update even on legacy DBs without the newer unique constraint."""
     monkeypatch.setattr(comicarr, "DATA_DIR", str(tmp_path))
@@ -377,3 +515,18 @@ def test_new_pullcheck_uses_canonical_weekly_key_casing():
     # It must never use the generic table-identity upsert helper.
     assert 'db.upsert("weekly"' not in source
     assert '_update_weekly_row(week["rowid"], newValue)' in source
+
+
+
+def test_locg_weekly_ingestion_uses_legacy_logical_key_helper():
+    """Live pull ingestion must not use the table-level weekly UPSERT conflict target."""
+    source = inspect.getsource(locg.locg)
+    helper = inspect.getsource(locg._upsert_weekly_release)
+
+    assert 'db.upsert("weekly"' not in source
+    assert "_upsert_weekly_release(controlValueDict, newValueDict)" in source
+
+    assert 'control_values["DynamicName"]' in helper
+    assert 'control_values["ISSUE"]' in helper
+    assert "weekly.update()" in helper
+    assert "weekly.insert()" in helper
