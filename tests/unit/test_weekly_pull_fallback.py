@@ -250,6 +250,110 @@ def test_pullit_drops_origin_metadata_when_later_week_fails_without_origin(monke
     assert "cause" not in result
     assert "retry_after" not in result
 
+def test_update_weekly_row_uses_rowid_without_upsert_constraint(tmp_path, monkeypatch):
+    """Existing weekly rows must update even on legacy DBs without the newer unique constraint."""
+    monkeypatch.setattr(comicarr, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(comicarr, "CONFIG", SimpleNamespace())
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    db.shutdown_engine()
+    engine = db.get_engine()
+
+    try:
+        # Deliberately mirror an older installed weekly schema:
+        # rowid is the primary key, but there is NO UNIQUE(ComicID, IssueID).
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE weekly (
+                    SHIPDATE TEXT,
+                    PUBLISHER TEXT,
+                    ISSUE TEXT,
+                    COMIC VARCHAR(150),
+                    EXTRA TEXT,
+                    STATUS TEXT,
+                    ComicID TEXT,
+                    IssueID TEXT,
+                    CV_Last_Update TEXT,
+                    DynamicName TEXT,
+                    weeknumber TEXT,
+                    year TEXT,
+                    volume TEXT,
+                    seriesyear TEXT,
+                    annuallink TEXT,
+                    format TEXT,
+                    rowid INTEGER PRIMARY KEY AUTOINCREMENT
+                )
+                """
+            )
+
+            conn.exec_driver_sql(
+                """
+                INSERT INTO weekly (
+                    ISSUE,
+                    COMIC,
+                    STATUS,
+                    ComicID,
+                    weeknumber,
+                    year,
+                    rowid
+                )
+                VALUES (
+                    '10',
+                    'Doctor Strange',
+                    'Skipped',
+                    '168938',
+                    '36',
+                    '2026',
+                    317
+                )
+                """
+            )
+
+        weeklypull._update_weekly_row(
+            317,
+            {
+                "ISSUE": "10",
+                "COMIC": "Doctor Strange",
+                "STATUS": "Downloaded",
+                "ComicID": "168938",
+                "weeknumber": 36,
+                "year": 2026,
+            },
+        )
+
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                """
+                SELECT
+                    rowid,
+                    ISSUE,
+                    COMIC,
+                    STATUS,
+                    ComicID,
+                    weeknumber,
+                    year
+                FROM weekly
+                ORDER BY rowid
+                """
+            ).mappings().all()
+
+        assert len(rows) == 1
+
+        row = rows[0]
+
+        assert row["rowid"] == 317
+        assert row["ISSUE"] == "10"
+        assert row["COMIC"] == "Doctor Strange"
+        assert row["STATUS"] == "Downloaded"
+        assert row["ComicID"] == "168938"
+        assert str(row["weeknumber"]) == "36"
+        assert str(row["year"]) == "2026"
+
+    finally:
+        db.shutdown_engine()
+
+
 def test_new_pullcheck_uses_canonical_weekly_key_casing():
     """Regression for the v0.38.16 weekly pull SQLAlchemy/key-casing crash."""
     source = inspect.getsource(weeklypull.new_pullcheck)
@@ -268,3 +372,8 @@ def test_new_pullcheck_uses_canonical_weekly_key_casing():
     assert 'newValue["weeknumber"]' in source
     assert 'newValue["year"]' in source
     assert 'newValue["STATUS"]' in source
+
+    # This path updates an existing weekly row identified by rowid.
+    # It must never use the generic table-identity upsert helper.
+    assert 'db.upsert("weekly"' not in source
+    assert '_update_weekly_row(week["rowid"], newValue)' in source
