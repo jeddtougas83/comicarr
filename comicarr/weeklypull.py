@@ -921,6 +921,31 @@ def pullitcheck(comic1off_name=None, comic1off_id=None, forcecheck=None, futurep
     return {"status": "success"}
 
 
+def _update_weekly_row(rowid, values):
+    """Update one existing weekly row by its stable rowid.
+
+    Weekly pull reconciliation is updating a row that already exists.
+    It must not use the generic db.upsert() helper because that helper
+    derives its conflict target from the table-level (ComicID, IssueID)
+    upsert identity, which is a different contract from this row-specific
+    reconciliation path.
+    """
+    rowid = int(rowid)
+
+    with db.get_engine().begin() as conn:
+        result = conn.execute(
+            weekly.update()
+            .where(weekly.c.rowid == rowid)
+            .values(**values)
+        )
+
+    if result.rowcount != 1:
+        raise RuntimeError(
+            f"Expected to update exactly one weekly row for rowid {rowid}; "
+            f"updated {result.rowcount}"
+        )
+
+
 def new_pullcheck(weeknumber, pullyear, comic1off_name=None, comic1off_id=None, forcecheck=None, issue=None):
     watchlist = []
     weeklylist = []
@@ -1285,7 +1310,6 @@ def new_pullcheck(weeknumber, pullyear, comic1off_name=None, comic1off_id=None, 
                         cstatus = None
 
                     logger.fdebug("date_downloaded: " + str(date_downloaded))
-                    controlValue = {"rowid": int(week["rowid"])}
                     if mismatched is False and any(
                         [
                             (idmatch and not namematch),
@@ -1346,7 +1370,7 @@ def new_pullcheck(weeknumber, pullyear, comic1off_name=None, comic1off_id=None, 
                         else:
                             newValue["STATUS"] = "Skipped"
 
-                    db.upsert("weekly", newValue, controlValue)
+                    _update_weekly_row(week["rowid"], newValue)
 
                     if mismatched is False and issueid:
                         logger.fdebug("issue id check passed.")
