@@ -9,6 +9,7 @@
 
 """Weekly pull-list upstream outage fallback tests."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -248,3 +249,20 @@ def test_pullit_drops_origin_metadata_when_later_week_fails_without_origin(monke
     assert "origin_error" not in result
     assert "cause" not in result
     assert "retry_after" not in result
+
+def test_new_pullcheck_uses_canonical_weekly_key_casing():
+    """Regression for the v0.38.16 weekly pull SQLAlchemy/key-casing crash."""
+    source = inspect.getsource(weeklypull.new_pullcheck)
+
+    # Raw SQL in new_pullcheck aliases this field as lowercase "issue".
+    assert 'week["ISSUE"]' not in source
+    assert 'week["Issue"]' not in source
+
+    # SQLAlchemy weekly table columns use these exact names.
+    assert 'newValue["WEEKNUMBER"]' not in source
+    assert 'newValue["YEAR"]' not in source
+    assert 'newValue["Status"]' not in source
+
+    assert 'newValue["weeknumber"]' in source
+    assert 'newValue["year"]' in source
+    assert 'newValue["STATUS"]' in source
