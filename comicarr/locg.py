@@ -68,6 +68,51 @@ def _retry_after_seconds(retry_after):
     return seconds if seconds > 0 else None
 
 
+def _upsert_weekly_release(control_values, values):
+    """Update or insert one Weekly Pull release using its legacy logical key.
+
+    The original Weekly Pull ingestion contract uses DynamicName + ISSUE as
+    the lookup identity. The generic db.upsert() helper instead derives a
+    table-level SQL conflict target, so it cannot preserve this legacy
+    behavior on installed databases without the newer unique constraint.
+    """
+    dynamic_name = control_values["DynamicName"]
+    issue = control_values["ISSUE"]
+
+    match = and_(
+        weekly.c.DynamicName == dynamic_name,
+        weekly.c.ISSUE == issue,
+    )
+
+    with db.get_engine().begin() as conn:
+        existing = conn.execute(
+            weekly.select()
+            .with_only_columns(weekly.c.rowid)
+            .where(match)
+            .limit(1)
+        ).first()
+
+        if existing is not None:
+            conn.execute(
+                weekly.update()
+                .where(match)
+                .values(**values)
+            )
+            return "updated"
+
+        insert_values = {
+            **values,
+            **control_values,
+        }
+
+        conn.execute(
+            weekly.insert()
+            .values(**insert_values)
+        )
+
+    return "inserted"
+
+
 def locg(pulldate=None, weeknumber=None, year=None):
 
     todaydate = datetime.datetime.today().replace(second=0, microsecond=0)
@@ -222,7 +267,7 @@ def locg(pulldate=None, weeknumber=None, year=None):
                 "seriesyear": x["seriesyear"],
                 "format": x["format"],
             }
-            db.upsert("weekly", newValueDict, controlValueDict)
+            _upsert_weekly_release(controlValueDict, newValueDict)
 
         logger.info("[PULL-LIST] Successfully populated pull-list into Comicarr for week %s of %s" % (weeknumber, year))
         pull_refresh = todaydate.strftime("%Y-%m-%d %H:%M:%S")
