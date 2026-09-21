@@ -2,8 +2,12 @@
 
 import pytest
 
+import comicarr.weekly_sources as weekly_sources
+
 from comicarr.weekly_sources import (
     aggregate_weekly_sources,
+    fetch_aggregated_weekly_releases,
+    get_default_weekly_providers,
     normalize_release,
 )
 
@@ -229,3 +233,176 @@ def test_normalize_release_rejects_incomplete_records(item):
             item,
             "fixture",
         )
+
+def test_default_provider_order_is_prh_then_lunar():
+    providers = get_default_weekly_providers()
+
+    assert [
+        name
+        for name, _fetch in providers
+    ] == [
+        "prh",
+        "lunar",
+    ]
+
+
+def test_default_provider_precedence_keeps_prh_fields(
+    monkeypatch,
+):
+    def prh(_week, _year):
+        return [
+            {
+                "series": "X-Men",
+                "issue": "37",
+                "publisher": "PRH Publisher",
+                "shipdate": "2026-09-16",
+                "source_id": "prh-37",
+                "raw_title": "X-Men #37 PRH",
+            }
+        ]
+
+    def lunar(_week, _year):
+        return [
+            {
+                "series": "X MEN",
+                "issue": "#37",
+                "publisher": "Lunar Publisher",
+                "shipdate": "09/16/2026",
+                "source_id": "lunar-37",
+                "raw_title": "X MEN #37 LUNAR",
+            }
+        ]
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_prh_weekly_releases",
+        prh,
+    )
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_lunar_weekly_releases",
+        lunar,
+    )
+
+    result = fetch_aggregated_weekly_releases(
+        37,
+        2026,
+    )
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+
+    release = result["releases"][0]
+
+    assert release["source"] == "prh"
+    assert release["series"] == "X-Men"
+    assert release["publisher"] == "PRH Publisher"
+    assert release["source_id"] == "prh-37"
+    assert release["raw_title"] == "X-Men #37 PRH"
+
+    assert release["sources"] == [
+        "prh",
+        "lunar",
+    ]
+
+    assert release["source_ids"] == {
+        "prh": "prh-37",
+        "lunar": "lunar-37",
+    }
+
+
+def test_default_provider_fail_soft_when_prh_fails(
+    monkeypatch,
+):
+    def broken_prh(_week, _year):
+        raise RuntimeError(
+            "PRH unavailable"
+        )
+
+    def lunar(_week, _year):
+        return [
+            {
+                "series": "Absolute Green Arrow",
+                "issue": "5",
+                "publisher": "DC Comics",
+                "shipdate": "2026-09-16",
+                "source_id": "lunar-ga-5",
+            }
+        ]
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_prh_weekly_releases",
+        broken_prh,
+    )
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_lunar_weekly_releases",
+        lunar,
+    )
+
+    result = fetch_aggregated_weekly_releases(
+        37,
+        2026,
+    )
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+    assert result["releases"][0]["source"] == "lunar"
+
+    assert result["providers"][0]["provider"] == "prh"
+    assert result["providers"][0]["status"] == "failure"
+    assert "PRH unavailable" in result["providers"][0]["error"]
+
+    assert result["providers"][1]["provider"] == "lunar"
+    assert result["providers"][1]["status"] == "success"
+
+
+def test_default_provider_fail_soft_when_lunar_fails(
+    monkeypatch,
+):
+    def prh(_week, _year):
+        return [
+            {
+                "series": "Daredevil",
+                "issue": "7",
+                "publisher": "Marvel",
+                "shipdate": "2026-09-16",
+                "source_id": "prh-dd-7",
+            }
+        ]
+
+    def broken_lunar(_week, _year):
+        raise RuntimeError(
+            "Lunar unavailable"
+        )
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_prh_weekly_releases",
+        prh,
+    )
+
+    monkeypatch.setattr(
+        weekly_sources,
+        "fetch_lunar_weekly_releases",
+        broken_lunar,
+    )
+
+    result = fetch_aggregated_weekly_releases(
+        37,
+        2026,
+    )
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+    assert result["releases"][0]["source"] == "prh"
+
+    assert result["providers"][0]["provider"] == "prh"
+    assert result["providers"][0]["status"] == "success"
+
+    assert result["providers"][1]["provider"] == "lunar"
+    assert result["providers"][1]["status"] == "failure"
+    assert "Lunar unavailable" in result["providers"][1]["error"]

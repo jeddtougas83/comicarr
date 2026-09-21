@@ -28,6 +28,9 @@ import re
 from datetime import date, datetime
 from typing import Callable, Iterable
 
+from comicarr.weekly_sources_lunar import fetch_lunar_weekly_releases
+from comicarr.weekly_sources_prh import fetch_prh_weekly_releases
+
 
 Provider = tuple[str, Callable[[int, int], Iterable[dict]]]
 
@@ -320,3 +323,33 @@ def aggregate_weekly_sources(
         "releases": releases,
         "providers": provider_results,
     }
+
+def get_default_weekly_providers():
+    """Return the ordered provider set for provider-independent Weekly Pull."""
+    return (
+        (
+            "prh",
+            fetch_prh_weekly_releases,
+        ),
+        (
+            "lunar",
+            fetch_lunar_weekly_releases,
+        ),
+    )
+
+
+def fetch_aggregated_weekly_releases(
+    weeknumber,
+    year,
+    *,
+    providers=None,
+):
+    """Fetch and aggregate the configured provider-independent sources."""
+    if providers is None:
+        providers = get_default_weekly_providers()
+
+    return aggregate_weekly_sources(
+        providers,
+        weeknumber,
+        year,
+    )
