@@ -28,6 +28,7 @@ import comicarr
 from comicarr import db, logger
 from comicarr.helpers import ignored_publisher_check
 from comicarr.tables import weekly
+from comicarr.weekly_sources import fetch_aggregated_weekly_releases
 
 CLOUDFLARE_ORIGIN_ERRORS = {
     "520": "returned an unknown error",
@@ -112,6 +113,358 @@ def _upsert_weekly_release(control_values, values):
 
     return "inserted"
 
+
+def _provider_result_to_pull(
+    provider_result,
+    weeknumber,
+    year,
+):
+    """Map provider-independent releases onto the legacy weekly ingest shape."""
+    releases = provider_result.get(
+        "releases",
+        [],
+    )
+
+    if not isinstance(
+        releases,
+        list,
+    ):
+        return []
+
+    pull = []
+
+    for release in releases:
+        if not isinstance(
+            release,
+            dict,
+        ):
+            continue
+
+        series = release.get(
+            "series"
+        )
+
+        issue = release.get(
+            "issue"
+        )
+
+        publisher = release.get(
+            "publisher"
+        )
+
+        shipdate = release.get(
+            "shipdate"
+        )
+
+        if not all(
+            [
+                series,
+                issue,
+                shipdate,
+            ]
+        ):
+            continue
+
+        if ignored_publisher_check(
+            publisher
+        ):
+            continue
+
+        pull.append(
+            {
+                "series": series,
+                "alias": None,
+                "issue": str(
+                    issue
+                ),
+                "publisher": publisher,
+                "shipdate": shipdate,
+                "coverdate": None,
+                "comicid": None,
+                "issueid": None,
+                "weeknumber": int(
+                    weeknumber
+                ),
+                "annuallink": None,
+                "year": int(
+                    year
+                ),
+                "volume": None,
+                "seriesyear": None,
+                # Provider-independent releases do not currently
+                # declare Comicarr's watchlist book type.
+                # Leaving this unset preserves name matching and
+                # avoids inventing a Print/One-Shot classification.
+                "format": None,
+            }
+        )
+
+    return pull
+
+
+def _ingest_provider_pull(
+    pull,
+    weeknumber,
+    year,
+    provider_states=None,
+):
+    """Populate weekly from normalized providers without requiring CV IDs."""
+    from comicarr.tables import metadata as table_metadata
+
+    table_metadata.create_all(
+        db.get_engine(),
+        tables=[
+            weekly
+        ],
+        checkfirst=True,
+    )
+
+    if not pull:
+        return {
+            "status": "failure"
+        }
+
+    logger.info(
+        "[PULL-LIST] Provider-independent sources returned "
+        "%s usable issues for week %s, %s"
+        % (
+            len(pull),
+            weeknumber,
+            year,
+        )
+    )
+
+    logger.info(
+        "Re-creating pullist to ensure everything's fresh."
+    )
+
+    with db.get_engine().begin() as conn:
+        conn.execute(
+            delete(
+                weekly
+            ).where(
+                and_(
+                    weekly.c.weeknumber
+                    == int(
+                        weeknumber
+                    ),
+                    weekly.c.year
+                    == int(
+                        year
+                    ),
+                )
+            )
+        )
+
+    for release in pull:
+        comicname = release[
+            "series"
+        ]
+
+        cl_d = comicarr.filechecker.FileChecker()
+
+        cl_dyninfo = cl_d.dynamic_replace(
+            comicname
+        )
+
+        dynamic_name = re.sub(
+            r"[\|\s]",
+            "",
+            cl_dyninfo[
+                "mod_seriesname"
+            ].lower(),
+        ).strip()
+
+        control_values = {
+            "DynamicName": dynamic_name,
+            "ISSUE": re.sub(
+                "#",
+                "",
+                release[
+                    "issue"
+                ],
+            ).strip(),
+        }
+
+        values = {
+            "SHIPDATE": release[
+                "shipdate"
+            ],
+            "PUBLISHER": release[
+                "publisher"
+            ],
+            "STATUS": "Skipped",
+            "COMIC": comicname,
+            # PRH/Lunar supply release metadata, not ComicVine
+            # series/issue IDs. new_pullcheck() resolves matching
+            # watchlist rows by DynamicName and performs CV enrichment.
+            "ComicID": None,
+            "IssueID": None,
+            "weeknumber": int(
+                weeknumber
+            ),
+            "annuallink": None,
+            "year": int(
+                year
+            ),
+            "volume": None,
+            "seriesyear": None,
+            "format": None,
+        }
+
+        _upsert_weekly_release(
+            control_values,
+            values,
+        )
+
+    logger.info(
+        "[PULL-LIST] Successfully populated provider-independent "
+        "pull-list into Comicarr for week %s of %s"
+        % (
+            weeknumber,
+            year,
+        )
+    )
+
+    pull_refresh = (
+        datetime.datetime.today()
+        .replace(
+            second=0,
+            microsecond=0,
+        )
+        .strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+
+    comicarr.CONFIG.writeconfig(
+        values={
+            "pull_refresh": (
+                pull_refresh
+            )
+        }
+    )
+
+    result = {
+        "status": "success",
+        "count": len(
+            pull
+        ),
+        "weeknumber": int(
+            weeknumber
+        ),
+        "year": int(
+            year
+        ),
+    }
+
+    if provider_states is not None:
+        result[
+            "providers"
+        ] = provider_states
+
+    return result
+
+
+def provider_locg(
+    weeknumber=None,
+    year=None,
+):
+    """Use PRH/Lunar first, retaining Walksoftly as a legacy fallback."""
+    try:
+        provider_result = (
+            fetch_aggregated_weekly_releases(
+                weeknumber,
+                year,
+            )
+        )
+    except Exception as exc:
+        logger.warn(
+            "[PULL-LIST] Provider-independent pull-list "
+            "retrieval failed unexpectedly: %s. "
+            "Falling back to Walksoftly."
+            % exc
+        )
+
+        provider_result = {
+            "status": "failure",
+            "providers": [],
+            "releases": [],
+        }
+
+    if (
+        provider_result.get(
+            "status"
+        )
+        == "success"
+    ):
+        pull = _provider_result_to_pull(
+            provider_result,
+            weeknumber,
+            year,
+        )
+
+        if pull:
+            return _ingest_provider_pull(
+                pull,
+                weeknumber,
+                year,
+                provider_states=(
+                    provider_result.get(
+                        "providers"
+                    )
+                ),
+            )
+
+        logger.warn(
+            "[PULL-LIST] Provider-independent sources "
+            "returned no usable releases after Comicarr "
+            "filtering. Falling back to Walksoftly."
+        )
+    else:
+        provider_states = (
+            provider_result.get(
+                "providers"
+            )
+            or []
+        )
+
+        provider_summary = ", ".join(
+            (
+                "%s=%s"
+                % (
+                    state.get(
+                        "provider",
+                        "unknown",
+                    ),
+                    state.get(
+                        "status",
+                        "unknown",
+                    ),
+                )
+            )
+            for state
+            in provider_states
+        )
+
+        if provider_summary:
+            logger.warn(
+                "[PULL-LIST] Provider-independent sources "
+                "did not return usable data [%s]. "
+                "Falling back to Walksoftly."
+                % provider_summary
+            )
+        else:
+            logger.warn(
+                "[PULL-LIST] Provider-independent sources "
+                "did not return usable data. "
+                "Falling back to Walksoftly."
+            )
+
+    return locg(
+        weeknumber=weeknumber,
+        year=year,
+    )
 
 def locg(pulldate=None, weeknumber=None, year=None):
 

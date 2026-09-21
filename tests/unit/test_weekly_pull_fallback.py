@@ -66,7 +66,7 @@ def test_pullit_uses_cached_week_when_upstream_fails(monkeypatch):
         lambda: {"weeknumber": 33, "year": 2026, "prev_weeknumber": 32, "prev_year": 2026},
     )
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda week, year: week == 33 and year == 2026)
-    monkeypatch.setattr(weeklypull.locg, "locg", lambda **kwargs: {"status": "failure"})
+    monkeypatch.setattr(weeklypull.locg, "provider_locg", lambda **kwargs: {"status": "failure"})
     new_pullcheck = MagicMock()
     monkeypatch.setattr(weeklypull, "new_pullcheck", new_pullcheck)
     monkeypatch.setattr(weeklypull.time, "sleep", lambda *_args: None)
@@ -89,7 +89,7 @@ def test_pullit_still_fails_without_cached_week(monkeypatch):
         lambda: {"weeknumber": 33, "year": 2026, "prev_weeknumber": 32, "prev_year": 2026},
     )
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda *_args: False)
-    monkeypatch.setattr(weeklypull.locg, "locg", lambda **kwargs: {"status": "failure"})
+    monkeypatch.setattr(weeklypull.locg, "provider_locg", lambda **kwargs: {"status": "failure"})
     monkeypatch.setattr(weeklypull, "new_pullcheck", MagicMock())
     monkeypatch.setattr(weeklypull.time, "sleep", lambda *_args: None)
 
@@ -112,7 +112,7 @@ def test_pullit_forwards_origin_outage_on_cached_week(monkeypatch):
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda week, year: week == 33 and year == 2026)
     monkeypatch.setattr(
         weeklypull.locg,
-        "locg",
+        "provider_locg",
         lambda **kwargs: {
             "status": "failure",
             "retry_after": 120,
@@ -145,7 +145,7 @@ def test_pullit_surfaces_retry_hint_when_serving_cached_week(monkeypatch):
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda week, year: week == 33 and year == 2026)
     monkeypatch.setattr(
         weeklypull.locg,
-        "locg",
+        "provider_locg",
         lambda **kwargs: {"status": "failure", "retry_after": 120, "origin_error": True},
     )
     monkeypatch.setattr(weeklypull, "new_pullcheck", MagicMock())
@@ -170,7 +170,7 @@ def test_pullit_forwards_origin_outage_cause_on_failure(monkeypatch):
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda *_args: False)
     monkeypatch.setattr(
         weeklypull.locg,
-        "locg",
+        "provider_locg",
         lambda **kwargs: {
             "status": "failure",
             "retry_after": 120,
@@ -204,7 +204,7 @@ def test_pullit_surfaces_retry_hint_on_failure(monkeypatch):
     monkeypatch.setattr(weeklypull, "_weekly_pull_has_data", lambda *_args: False)
     monkeypatch.setattr(
         weeklypull.locg,
-        "locg",
+        "provider_locg",
         lambda **kwargs: {"status": "failure", "retry_after": 120, "origin_error": True},
     )
     monkeypatch.setattr(weeklypull, "new_pullcheck", MagicMock())
@@ -238,7 +238,7 @@ def test_pullit_drops_origin_metadata_when_later_week_fails_without_origin(monke
             }
         return {"status": "failure"}
 
-    monkeypatch.setattr(weeklypull.locg, "locg", locg_by_week)
+    monkeypatch.setattr(weeklypull.locg, "provider_locg", locg_by_week)
     monkeypatch.setattr(weeklypull, "new_pullcheck", MagicMock())
     monkeypatch.setattr(weeklypull.time, "sleep", lambda *_args: None)
 
@@ -530,3 +530,164 @@ def test_locg_weekly_ingestion_uses_legacy_logical_key_helper():
     assert 'control_values["ISSUE"]' in helper
     assert "weekly.update()" in helper
     assert "weekly.insert()" in helper
+
+
+def test_provider_locg_prefers_aggregated_sources(monkeypatch):
+    config = SimpleNamespace(
+        IGNORED_PUBLISHERS=None,
+    )
+    monkeypatch.setattr(
+        comicarr,
+        "CONFIG",
+        config,
+    )
+
+    provider_result = {
+        "status": "success",
+        "providers": [
+            {
+                "provider": "prh",
+                "status": "success",
+                "count": 1,
+                "rejected": 0,
+                "error": None,
+            },
+            {
+                "provider": "lunar",
+                "status": "success",
+                "count": 1,
+                "rejected": 0,
+                "error": None,
+            },
+        ],
+        "releases": [
+            {
+                "series": "X-Men",
+                "issue": "37",
+                "publisher": "Marvel",
+                "shipdate": "2026-09-16",
+                "source": "prh",
+                "source_id": "prh-xmen-37",
+                "raw_title": "X-MEN #37",
+                "sources": [
+                    "prh",
+                ],
+                "source_ids": {
+                    "prh": "prh-xmen-37",
+                },
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        locg,
+        "fetch_aggregated_weekly_releases",
+        lambda weeknumber, year: provider_result,
+    )
+
+    ingest = MagicMock(
+        return_value={
+            "status": "success",
+            "count": 1,
+            "weeknumber": 37,
+            "year": 2026,
+        }
+    )
+
+    monkeypatch.setattr(
+        locg,
+        "_ingest_provider_pull",
+        ingest,
+    )
+
+    legacy = MagicMock(
+        side_effect=AssertionError(
+            "Walksoftly fallback must not run "
+            "when PRH/Lunar succeed"
+        )
+    )
+
+    monkeypatch.setattr(
+        locg,
+        "locg",
+        legacy,
+    )
+
+    result = locg.provider_locg(
+        weeknumber=37,
+        year=2026,
+    )
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+
+    legacy.assert_not_called()
+    ingest.assert_called_once()
+
+    pull = ingest.call_args.args[0]
+
+    assert len(pull) == 1
+    assert pull[0]["series"] == "X-Men"
+    assert pull[0]["issue"] == "37"
+    assert pull[0]["publisher"] == "Marvel"
+    assert pull[0]["shipdate"] == "2026-09-16"
+
+    assert pull[0]["comicid"] is None
+    assert pull[0]["issueid"] is None
+    assert pull[0]["format"] is None
+    assert pull[0]["annuallink"] is None
+
+
+def test_provider_locg_falls_back_to_legacy_locg(monkeypatch):
+    monkeypatch.setattr(
+        locg,
+        "fetch_aggregated_weekly_releases",
+        lambda weeknumber, year: {
+            "status": "failure",
+            "providers": [
+                {
+                    "provider": "prh",
+                    "status": "failure",
+                    "count": 0,
+                    "rejected": 0,
+                    "error": "offline",
+                },
+                {
+                    "provider": "lunar",
+                    "status": "failure",
+                    "count": 0,
+                    "rejected": 0,
+                    "error": "offline",
+                },
+            ],
+            "releases": [],
+        },
+    )
+
+    legacy_result = {
+        "status": "failure",
+        "origin_error": True,
+        "cause": locg.ORIGIN_OUTAGE_CAUSE,
+    }
+
+    legacy = MagicMock(
+        return_value=legacy_result
+    )
+
+    monkeypatch.setattr(
+        locg,
+        "locg",
+        legacy,
+    )
+
+    result = locg.provider_locg(
+        weeknumber=37,
+        year=2026,
+    )
+
+    assert result == legacy_result
+
+    legacy.assert_called_once_with(
+        weeknumber=37,
+        year=2026,
+    )
