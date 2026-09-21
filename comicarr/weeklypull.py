@@ -133,7 +133,7 @@ def pullit(forcecheck=None, weeknumber=None, year=None):
                 "[PULL-LIST] Populating & Loading pull-list data directly from alternate website for specific week of %s, %s"
                 % (weeknumber_mod, year_mod)
             )
-            chk_locg = locg.locg(weeknumber=weeknumber_mod, year=year_mod)
+            chk_locg = locg.provider_locg(weeknumber=weeknumber_mod, year=year_mod)
 
             if chk_locg["status"] == "up2date":
                 logger.info(
