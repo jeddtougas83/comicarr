@@ -379,6 +379,39 @@ class TestComicScan:
         assert result["scan_results"][0]["match"]["comicid"] == "12345"
         assert comicsync.COMIC_SCAN_ID is not None
 
+    def test_match_series_normalizes_numeric_comicvine_id_to_string(self, comicsync):
+        numeric_comic_id = 150431
+        cv_result = {
+            "name": "Regression Series",
+            "comicid": numeric_comic_id,
+            "comicyear": "2026",
+            "publisher": "Regression Publisher",
+            "issues": "10",
+            "comicthumb": None,
+            "comicimage": None,
+        }
+
+        with (
+            patch(
+                "comicarr.mb.findComic",
+                return_value={"results": [cv_result]},
+            ),
+            patch.object(
+                comicsync,
+                "find_best_match",
+                return_value=(cv_result, 1.0),
+            ),
+        ):
+            result = comicsync._match_series(
+                "Regression Series",
+                ["/comics/Regression Series/001.cbz"],
+                {},
+            )
+
+        assert result["matched"] is True
+        assert result["match"]["comicid"] == "150431"
+        assert isinstance(result["match"]["comicid"], str)
+
     def test_empty_directory(self, comicsync):
         with (
             patch("os.path.isdir", return_value=True),

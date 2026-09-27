@@ -339,7 +339,7 @@ def _match_series(series_name, files, existing_series):
     confidence = int(best_score * 100)
     result["matched"] = True
     result["match"] = {
-        "comicid": best_match.get("comicid"),
+        "comicid": str(best_match.get("comicid") or ""),
         "name": best_match.get("name", ""),
         "year": best_match.get("comicyear", ""),
         "publisher": best_match.get("publisher", ""),
