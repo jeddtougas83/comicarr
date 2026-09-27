@@ -532,6 +532,665 @@ def test_locg_weekly_ingestion_uses_legacy_logical_key_helper():
     assert "weekly.insert()" in helper
 
 
+
+
+def test_provider_pull_requires_every_configured_provider_for_replace():
+    assert (
+        locg._provider_pull_is_complete(
+            [
+                {
+                    "provider": "prh",
+                    "status": "success",
+                },
+            ]
+        )
+        is False
+    )
+
+    assert (
+        locg._provider_pull_is_complete(
+            [
+                {
+                    "provider": "lunar",
+                    "status": "success",
+                },
+            ]
+        )
+        is False
+    )
+
+    assert (
+        locg._provider_pull_is_complete(
+            [
+                {
+                    "provider": "prh",
+                    "status": "success",
+                },
+                {
+                    "provider": "lunar",
+                    "status": "success",
+                },
+            ]
+        )
+        is True
+    )
+
+    assert (
+        locg._provider_pull_is_complete(
+            [
+                {
+                    "provider": "prh",
+                    "status": "success",
+                },
+                {
+                    "provider": "lunar",
+                    "status": "failure",
+                },
+            ]
+        )
+        is False
+    )
+
+
+class _PartialProviderFileChecker:
+    def dynamic_replace(
+        self,
+        comicname,
+    ):
+        return {
+            "mod_seriesname": (
+                comicname.lower()
+                .replace(
+                    " ",
+                    "",
+                )
+                .replace(
+                    "-",
+                    "",
+                )
+                .replace(
+                    ":",
+                    "",
+                )
+            )
+        }
+
+
+def _provider_pull_test_config(
+    monkeypatch,
+):
+    writeconfig = MagicMock()
+
+    monkeypatch.setattr(
+        comicarr,
+        "CONFIG",
+        SimpleNamespace(
+            writeconfig=writeconfig,
+        ),
+    )
+
+    monkeypatch.setattr(
+        comicarr.filechecker,
+        "FileChecker",
+        _PartialProviderFileChecker,
+    )
+
+    return writeconfig
+
+
+def _provider_states(
+    prh,
+    lunar,
+):
+    return [
+        {
+            "provider": "prh",
+            "status": prh,
+            "count": (
+                1
+                if prh
+                == "success"
+                else 0
+            ),
+            "rejected": 0,
+            "error": (
+                None
+                if prh
+                == "success"
+                else "offline"
+            ),
+        },
+        {
+            "provider": "lunar",
+            "status": lunar,
+            "count": (
+                1
+                if lunar
+                == "success"
+                else 0
+            ),
+            "rejected": 0,
+            "error": (
+                None
+                if lunar
+                == "success"
+                else "offline"
+            ),
+        },
+    ]
+
+
+def test_complete_provider_refresh_replaces_target_week(
+    weekly_db,
+    monkeypatch,
+):
+    _provider_pull_test_config(
+        monkeypatch
+    )
+
+    with weekly_db.begin() as conn:
+        conn.execute(
+            insert(
+                weekly
+            ),
+            [
+                {
+                    "SHIPDATE": "2026-09-16",
+                    "PUBLISHER": "DC Comics",
+                    "ISSUE": "5",
+                    "COMIC": "Cached Lunar Title",
+                    "STATUS": "Downloaded",
+                    "ComicID": "999001",
+                    "IssueID": "999002",
+                    "DynamicName": "cachedlunartitle",
+                    "weeknumber": "37",
+                    "year": "2026",
+                },
+            ],
+        )
+
+    result = (
+        locg._ingest_provider_pull(
+            [
+                {
+                    "series": "X-Men",
+                    "issue": "37",
+                    "publisher": "Marvel",
+                    "shipdate": "2026-09-16",
+                },
+            ],
+            37,
+            2026,
+            provider_states=(
+                _provider_states(
+                    "success",
+                    "success",
+                )
+            ),
+        )
+    )
+
+    with weekly_db.connect() as conn:
+        rows = (
+            conn.exec_driver_sql(
+                """
+                SELECT
+                    rowid,
+                    DynamicName,
+                    ISSUE,
+                    STATUS,
+                    ComicID,
+                    IssueID
+                FROM weekly
+                WHERE
+                    CAST(weeknumber AS INTEGER) = 37
+                    AND CAST(year AS INTEGER) = 2026
+                ORDER BY rowid
+                """
+            )
+            .mappings()
+            .all()
+        )
+
+    assert (
+        result[
+            "refresh_mode"
+        ]
+        == "replace"
+    )
+
+    assert len(
+        rows
+    ) == 1
+
+    assert (
+        rows[0][
+            "DynamicName"
+        ]
+        == "xmen"
+    )
+
+    assert (
+        rows[0][
+            "ISSUE"
+        ]
+        == "37"
+    )
+
+    assert (
+        rows[0][
+            "STATUS"
+        ]
+        == "Skipped"
+    )
+
+    assert (
+        rows[0][
+            "ComicID"
+        ]
+        is None
+    )
+
+    assert (
+        rows[0][
+            "IssueID"
+        ]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "prh_status",
+        "lunar_status",
+    ),
+    [
+        (
+            "success",
+            "failure",
+        ),
+        (
+            "failure",
+            "success",
+        ),
+    ],
+)
+def test_partial_provider_merge_preserves_cached_rows_and_enrichment(
+    weekly_db,
+    monkeypatch,
+    prh_status,
+    lunar_status,
+):
+    _provider_pull_test_config(
+        monkeypatch
+    )
+
+    with weekly_db.begin() as conn:
+        conn.execute(
+            insert(
+                weekly
+            ),
+            [
+                {
+                    "SHIPDATE": "2026-09-15",
+                    "PUBLISHER": "Marvel",
+                    "ISSUE": "37",
+                    "COMIC": "X-Men",
+                    "STATUS": "Downloaded",
+                    "ComicID": "158814",
+                    "IssueID": "1193132",
+                    "DynamicName": "xmen",
+                    "weeknumber": "37",
+                    "year": "2026",
+                    "volume": "7",
+                    "seriesyear": "2024",
+                    "annuallink": "123456",
+                    "format": "Print",
+                },
+                {
+                    "SHIPDATE": "2026-09-16",
+                    "PUBLISHER": "DC Comics",
+                    "ISSUE": "5",
+                    "COMIC": "Absolute Green Arrow",
+                    "STATUS": "Wanted",
+                    "ComicID": "173001",
+                    "IssueID": "1193999",
+                    "DynamicName": "absolutegreenarrow",
+                    "weeknumber": "37",
+                    "year": "2026",
+                    "volume": None,
+                    "seriesyear": None,
+                    "annuallink": None,
+                    "format": None,
+                },
+            ],
+        )
+
+    with weekly_db.connect() as conn:
+        xmen_before = (
+            conn.exec_driver_sql(
+                """
+                SELECT rowid
+                FROM weekly
+                WHERE
+                    DynamicName = 'xmen'
+                    AND ISSUE = '37'
+                """
+            )
+            .mappings()
+            .one()
+        )
+
+    result = (
+        locg._ingest_provider_pull(
+            [
+                {
+                    "series": "X-Men",
+                    "issue": "37",
+                    "publisher": "Marvel Comics",
+                    "shipdate": "2026-09-16",
+                },
+                {
+                    "series": "New Marvel Title",
+                    "issue": "1",
+                    "publisher": "Marvel",
+                    "shipdate": "2026-09-16",
+                },
+            ],
+            37,
+            2026,
+            provider_states=(
+                _provider_states(
+                    prh_status,
+                    lunar_status,
+                )
+            ),
+        )
+    )
+
+    with weekly_db.connect() as conn:
+        rows = (
+            conn.exec_driver_sql(
+                """
+                SELECT
+                    rowid,
+                    SHIPDATE,
+                    PUBLISHER,
+                    ISSUE,
+                    COMIC,
+                    STATUS,
+                    ComicID,
+                    IssueID,
+                    DynamicName,
+                    volume,
+                    seriesyear,
+                    annuallink,
+                    format
+                FROM weekly
+                WHERE
+                    CAST(weeknumber AS INTEGER) = 37
+                    AND CAST(year AS INTEGER) = 2026
+                ORDER BY DynamicName, ISSUE
+                """
+            )
+            .mappings()
+            .all()
+        )
+
+    by_name = {
+        row[
+            "DynamicName"
+        ]: row
+        for row
+        in rows
+    }
+
+    assert (
+        result[
+            "refresh_mode"
+        ]
+        == "merge"
+    )
+
+    # Unavailable-provider cache remains in place.
+    assert (
+        "absolutegreenarrow"
+        in by_name
+    )
+
+    assert (
+        by_name[
+            "absolutegreenarrow"
+        ][
+            "STATUS"
+        ]
+        == "Wanted"
+    )
+
+    assert (
+        by_name[
+            "absolutegreenarrow"
+        ][
+            "ComicID"
+        ]
+        == "173001"
+    )
+
+    assert (
+        by_name[
+            "absolutegreenarrow"
+        ][
+            "IssueID"
+        ]
+        == "1193999"
+    )
+
+    # Matching provider row receives fresh release metadata but keeps
+    # reconciliation state and its physical row identity.
+    xmen = by_name[
+        "xmen"
+    ]
+
+    assert (
+        xmen[
+            "rowid"
+        ]
+        == xmen_before[
+            "rowid"
+        ]
+    )
+
+    assert (
+        xmen[
+            "SHIPDATE"
+        ]
+        == "2026-09-16"
+    )
+
+    assert (
+        xmen[
+            "PUBLISHER"
+        ]
+        == "Marvel Comics"
+    )
+
+    assert (
+        xmen[
+            "STATUS"
+        ]
+        == "Downloaded"
+    )
+
+    assert (
+        xmen[
+            "ComicID"
+        ]
+        == "158814"
+    )
+
+    assert (
+        xmen[
+            "IssueID"
+        ]
+        == "1193132"
+    )
+
+    assert (
+        xmen[
+            "volume"
+        ]
+        == "7"
+    )
+
+    assert (
+        xmen[
+            "seriesyear"
+        ]
+        == "2024"
+    )
+
+    assert (
+        xmen[
+            "annuallink"
+        ]
+        == "123456"
+    )
+
+    assert (
+        xmen[
+            "format"
+        ]
+        == "Print"
+    )
+
+    # New available-provider releases can still be added during the merge.
+    new_row = by_name[
+        "newmarveltitle"
+    ]
+
+    assert (
+        new_row[
+            "STATUS"
+        ]
+        == "Skipped"
+    )
+
+    assert (
+        new_row[
+            "ComicID"
+        ]
+        is None
+    )
+
+    assert (
+        new_row[
+            "IssueID"
+        ]
+        is None
+    )
+
+    assert len(
+        rows
+    ) == 3
+
+
+def test_provider_pull_without_complete_state_uses_safe_merge(
+    weekly_db,
+    monkeypatch,
+):
+    _provider_pull_test_config(
+        monkeypatch
+    )
+
+    with weekly_db.begin() as conn:
+        conn.execute(
+            insert(
+                weekly
+            ),
+            {
+                "SHIPDATE": "2026-09-16",
+                "PUBLISHER": "DC Comics",
+                "ISSUE": "5",
+                "COMIC": "Absolute Green Arrow",
+                "STATUS": "Archived",
+                "ComicID": "173001",
+                "IssueID": "1193999",
+                "DynamicName": "absolutegreenarrow",
+                "weeknumber": "37",
+                "year": "2026",
+            },
+        )
+
+    result = (
+        locg._ingest_provider_pull(
+            [
+                {
+                    "series": "New Marvel Title",
+                    "issue": "1",
+                    "publisher": "Marvel",
+                    "shipdate": "2026-09-16",
+                },
+            ],
+            37,
+            2026,
+            provider_states=None,
+        )
+    )
+
+    with weekly_db.connect() as conn:
+        count = conn.exec_driver_sql(
+            """
+            SELECT COUNT(*)
+            FROM weekly
+            WHERE
+                CAST(weeknumber AS INTEGER) = 37
+                AND CAST(year AS INTEGER) = 2026
+            """
+        ).scalar_one()
+
+        archived = (
+            conn.exec_driver_sql(
+                """
+                SELECT STATUS, ComicID, IssueID
+                FROM weekly
+                WHERE DynamicName = 'absolutegreenarrow'
+                """
+            )
+            .mappings()
+            .one()
+        )
+
+    assert (
+        result[
+            "refresh_mode"
+        ]
+        == "merge"
+    )
+
+    assert count == 2
+
+    assert (
+        archived[
+            "STATUS"
+        ]
+        == "Archived"
+    )
+
+    assert (
+        archived[
+            "ComicID"
+        ]
+        == "173001"
+    )
+
+    assert (
+        archived[
+            "IssueID"
+        ]
+        == "1193999"
+    )
+
+
 def test_provider_locg_prefers_aggregated_sources(monkeypatch):
     config = SimpleNamespace(
         IGNORED_PUBLISHERS=None,

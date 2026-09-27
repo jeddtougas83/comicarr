@@ -28,7 +28,10 @@ import comicarr
 from comicarr import db, logger
 from comicarr.helpers import ignored_publisher_check
 from comicarr.tables import weekly
-from comicarr.weekly_sources import fetch_aggregated_weekly_releases
+from comicarr.weekly_sources import (
+    fetch_aggregated_weekly_releases,
+    get_default_weekly_providers,
+)
 
 CLOUDFLARE_ORIGIN_ERRORS = {
     "520": "returned an unknown error",
@@ -202,13 +205,102 @@ def _provider_result_to_pull(
     return pull
 
 
+def _provider_pull_is_complete(
+    provider_states,
+):
+    """Return True only when every configured provider completed successfully."""
+    if not provider_states:
+        return False
+
+    expected_providers = {
+        provider_name
+        for provider_name, _fetch
+        in get_default_weekly_providers()
+    }
+
+    if not expected_providers:
+        return False
+
+    reported_states = {
+        state.get(
+            "provider"
+        ): state.get(
+            "status"
+        )
+        for state
+        in provider_states
+        if isinstance(
+            state,
+            dict,
+        )
+        and state.get(
+            "provider"
+        )
+    }
+
+    if (
+        set(
+            reported_states
+        )
+        != expected_providers
+    ):
+        return False
+
+    return all(
+        reported_states[
+            provider_name
+        ]
+        == "success"
+        for provider_name
+        in expected_providers
+    )
+
+
+def _existing_weekly_release(
+    control_values,
+):
+    """Return the existing logical Weekly Pull row, if present."""
+    match = and_(
+        weekly.c.DynamicName
+        == control_values[
+            "DynamicName"
+        ],
+        weekly.c.ISSUE
+        == control_values[
+            "ISSUE"
+        ],
+    )
+
+    with db.get_engine().connect() as conn:
+        existing = (
+            conn.execute(
+                weekly.select()
+                .where(
+                    match
+                )
+                .limit(
+                    1
+                )
+            )
+            .mappings()
+            .first()
+        )
+
+    if existing is None:
+        return None
+
+    return dict(
+        existing
+    )
+
+
 def _ingest_provider_pull(
     pull,
     weeknumber,
     year,
     provider_states=None,
 ):
-    """Populate weekly from normalized providers without requiring CV IDs."""
+    """Populate weekly from provider data without destructive partial refreshes."""
     from comicarr.tables import metadata as table_metadata
 
     table_metadata.create_all(
@@ -234,25 +326,84 @@ def _ingest_provider_pull(
         )
     )
 
-    logger.info(
-        "Re-creating pullist to ensure everything's fresh."
+    complete_refresh = (
+        _provider_pull_is_complete(
+            provider_states
+        )
     )
 
-    with db.get_engine().begin() as conn:
-        conn.execute(
-            delete(
-                weekly
-            ).where(
-                and_(
-                    weekly.c.weeknumber
-                    == int(
-                        weeknumber
-                    ),
-                    weekly.c.year
-                    == int(
-                        year
-                    ),
+    if complete_refresh:
+        refresh_mode = (
+            "replace"
+        )
+
+        logger.info(
+            "[PULL-LIST] All provider-independent sources "
+            "completed successfully. Replacing cached week %s, %s."
+            % (
+                weeknumber,
+                year,
+            )
+        )
+
+        with db.get_engine().begin() as conn:
+            conn.execute(
+                delete(
+                    weekly
+                ).where(
+                    and_(
+                        weekly.c.weeknumber
+                        == int(
+                            weeknumber
+                        ),
+                        weekly.c.year
+                        == int(
+                            year
+                        ),
+                    )
                 )
+            )
+
+    else:
+        refresh_mode = (
+            "merge"
+        )
+
+        provider_summary = ", ".join(
+            "%s=%s"
+            % (
+                state.get(
+                    "provider",
+                    "unknown",
+                ),
+                state.get(
+                    "status",
+                    "unknown",
+                ),
+            )
+            for state
+            in (
+                provider_states
+                or []
+            )
+            if isinstance(
+                state,
+                dict,
+            )
+        )
+
+        if not provider_summary:
+            provider_summary = (
+                "provider state unavailable"
+            )
+
+        logger.warn(
+            "[PULL-LIST] Provider-independent refresh is partial "
+            "[%s]. Merging week %s, %s without deleting cached rows."
+            % (
+                provider_summary,
+                weeknumber,
+                year,
             )
         )
 
@@ -312,15 +463,54 @@ def _ingest_provider_pull(
             "format": None,
         }
 
+        if refresh_mode == "merge":
+            existing = (
+                _existing_weekly_release(
+                    control_values
+                )
+            )
+
+            if existing is not None:
+                # Partial refreshes must never erase reconciliation state
+                # already attached to the cached logical release.
+                for key in (
+                    "STATUS",
+                    "ComicID",
+                    "IssueID",
+                    "annuallink",
+                    "volume",
+                    "seriesyear",
+                    "format",
+                ):
+                    preserved = (
+                        existing.get(
+                            key
+                        )
+                    )
+
+                    if preserved not in (
+                        None,
+                        "",
+                    ):
+                        values[
+                            key
+                        ] = preserved
+
         _upsert_weekly_release(
             control_values,
             values,
         )
 
     logger.info(
-        "[PULL-LIST] Successfully populated provider-independent "
-        "pull-list into Comicarr for week %s of %s"
+        "[PULL-LIST] Successfully %s provider-independent "
+        "pull-list data for week %s of %s"
         % (
+            (
+                "replaced"
+                if refresh_mode
+                == "replace"
+                else "merged"
+            ),
             weeknumber,
             year,
         )
@@ -356,6 +546,7 @@ def _ingest_provider_pull(
         "year": int(
             year
         ),
+        "refresh_mode": refresh_mode,
     }
 
     if provider_states is not None:
@@ -364,7 +555,6 @@ def _ingest_provider_pull(
         ] = provider_states
 
     return result
-
 
 def provider_locg(
     weeknumber=None,
